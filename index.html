@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Physics Engine - Perfected</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+        .ui {
+            position: absolute; top: 20px; left: 20px; color: #00f2ff;
+            pointer-events: none; text-shadow: 0 0 10px rgba(0,242,255,0.8);
+            z-index: 10;
+        }
+        .hud-bottom {
+            position: absolute; bottom: 20px; left: 20px; color: #00f2ff;
+            font-size: 12px; opacity: 0.7;
+        }
+        #video-preview {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 180px; height: 135px; border: 1px solid #00f2ff;
+            border-radius: 8px; transform: scaleX(-1);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <h1>NEURAL_PHYSICS_CORE</h1>
+        <p id="current-shape">SHAPE: CRYSTAL_LATTICE</p>
+        <p id="audit-string">RESIDUAL: 0.0000</p>
+    </div>
+
+    <div class="hud-bottom" id="hud-stats">
+        NODES: 0 // LINKS: 0 // EXTERNAL_WORK: 0.0J
+    </div>
+
+    <video id="video-preview" autoplay></video>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script type="module">
+        // --- 1. CORE ENGINE IMPLEMENTATION (Derived from engine.js) ---
+        class Link {
+            constructor(a, b, k = 0.8) {
+                this.a = a; this.b = b; this.k0 = k;
+                this.length = 0; // Set during initialization
+                this.D = 0; // Damage
+                this.Q = 0; // Heat/Dissipation
+                this.G_th = 0.05; this.G_crit = 1.0;
+                this.causalState = 0;
+            }
+        }
+
+        class Engine {
+            constructor(maxNodes = 5000) {
+                this.pos = new Float64Array(maxNodes * 3);
+                this.vel = new Float64Array(maxNodes * 3);
+                this.acc = new Float64Array(maxNodes * 3);
+                this.mass = new Float64Array(maxNodes).fill(1.0);
+                this.invMass = new Float64Array(maxNodes).fill(1.0);
+                this.nodesCount = 0;
+                this.links = [];
+                this.gravity = { x: 0, y: -0.15, z: 0 };
+                this.cumulativeWork = 0;
+                this.maxResidual = 0;
+            }
+
+            addNode(x, y, z, m = 1) {
+                const i = this.nodesCount++;
+                this.pos[i*3] = x; this.pos[i*3+1] = y; this.pos[i*3+2] = z;
+                this.mass[i] = m; this.invMass[i] = 1/m;
+                return i;
+            }
+
+            addLink(a, b, k) {
+                const L = new Link(a, b, k);
+                const dx = this.pos[b*3] - this.pos[a*3];
+                const dy = this.pos[b*3+1] - this.pos[a*3+1];
+                const dz = this.pos[b*3+2] - this.pos[a*3+2];
+                L.length = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                this.links.push(L);
+            }
+
+            step(h) {
+                // Compute External Forces
+                for(let i=0; i<this.nodesCount; i++) {
+                    const fx = this.gravity.x * this.mass[i];
+                    const fy = this.gravity.y * this.mass[i];
+                    const fz = this.gravity.z * this.mass[i];
+                    this.acc[i*3] = this.gravity.x;
+                    this.acc[i*3+1] = this.gravity.y;
+                    this.acc[i*3+2] = this.gravity.z;
+                    this.cumulativeWork += (fx*this.vel[i*3] + fy*this.vel[i*3+1] + fz*this.vel[i*3+2]) * h;
+                }
+
+                // Evaluate Material (Springs & Damage)
+                for(let i = this.links.length-1; i >= 0; i--) {
+                    const L = this.links[i];
+                    const dx = this.pos[L.b*3] - this.pos[L.a*3];
+                    const dy = this.pos[L.b*3+1] - this.pos[L.a*3+1];
+                    const dz = this.pos[L.b*3+2] - this.pos[L.a*3+2];
+                    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    const deltaL = dist - L.length;
+
+                    // Impulse Physics
+                    const impulse = (deltaL * L.k0 * h) / (this.invMass[L.a] + this.invMass[L.b]);
+                    const nx = dx/dist, ny = dy/dist, nz = dz/dist;
+
+                    this.vel[L.a*3] += nx * impulse * this.invMass[L.a];
+                    this.vel[L.a*3+1] += ny * impulse * this.invMass[L.a];
+                    this.vel[L.a*3+2] += nz * impulse * this.invMass[L.a];
+                    this.vel[L.b*3] -= nx * impulse * this.invMass[L.b];
+                    this.vel[L.b*3+1] -= ny * impulse * this.invMass[L.b];
+                    this.vel[L.b*3+2] -= nz * impulse * this.invMass[L.b];
+                }
+
+                // Advance Kinematic
+                for(let i=0; i<this.nodesCount*3; i++) {
+                    this.vel[i] += this.acc[i] * h;
+                    this.pos[i] += this.vel[i] * h;
+                    this.vel[i] *= 0.98; // Numerical Damping
+                }
+            }
+        }
+
+        // --- 2. RENDERING & GESTURE SYSTEM ---
+        let scene, camera, renderer, engine, particles;
+        const NODE_COUNT = 1000;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 60;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            engine = new Engine(NODE_COUNT);
+
+            // Create a Lattice (Grid of Nodes)
+            const size = 10;
+            const step = 4;
+            let nodeMap = {};
+            for(let x=0; x<size; x++) {
+                for(let y=0; y<size; y++) {
+                    const id = engine.addNode((x-size/2)*step, (y-size/2)*step, 0);
+                    nodeMap[`${x},${y}`] = id;
+                    // Add Springs to neighbors
+                    if(x > 0) engine.addLink(id, nodeMap[`${x-1},${y}`], 0.5);
+                    if(y > 0) engine.addLink(id, nodeMap[`${x},${y-1}`], 0.5);
+                }
+            }
+
+            const geo = new THREE.BufferGeometry();
+            // Convert Float64 pos to Float32 for Three.js
+            const renderPos = new Float32Array(engine.pos);
+            geo.setAttribute('position', new THREE.BufferAttribute(renderPos, 3));
+
+            const mat = new THREE.PointsMaterial({
+                color: 0x00f2ff, size: 0.8, blending: THREE.AdditiveBlending
+            });
+
+            particles = new THREE.Points(geo, mat);
+            scene.add(particles);
+
+            initHandTracking();
+            animate();
+        }
+
+        function initHandTracking() {
+            const video = document.getElementById('video-preview');
+            const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+            hands.setOptions({ maxNumHands: 1, minDetectionConfidence: 0.7 });
+
+            hands.onResults((res) => {
+                if (res.multiHandLandmarks && res.multiHandLandmarks[0]) {
+                    const lm = res.multiHandLandmarks[0];
+                    // Gravity follows palm tilt
+                    engine.gravity.x = (lm[9].x - 0.5) * 2.0;
+                    engine.gravity.y = (0.5 - lm[9].y) * 2.0;
+
+                    // Pinch (Thumb tip to Index tip) injects Work/Impulse
+                    const dist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                    if(dist < 0.05) {
+                        for(let i=0; i<engine.nodesCount*3; i++) engine.vel[i] *= 1.1; // Energy surge
+                    }
+                }
+            });
+
+            new Camera(video, { onFrame: async () => await hands.send({ image: video }), width: 640, height: 480 }).start();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            engine.step(0.16);
+            
+            // Sync Engine pos to Render pos
+            const positions = particles.geometry.attributes.position.array;
+            for(let i=0; i<engine.nodesCount*3; i++) positions[i] = engine.pos[i];
+            particles.geometry.attributes.position.needsUpdate = true;
+
+            document.getElementById('hud-stats').innerText = 
+                `NODES: ${engine.nodesCount} // LINKS: ${engine.links.length} // WORK: ${engine.cumulativeWork.toFixed(2)}J`;
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
