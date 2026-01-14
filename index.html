@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Physics Particle Engine</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: monospace; }
+        canvas { display: block; }
+        .ui {
+            position: absolute; top: 20px; left: 20px; color: #00f2ff;
+            pointer-events: none; text-shadow: 0 0 5px rgba(0,242,255,0.5);
+            z-index: 10;
+        }
+        #video-preview {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 160px; height: 120px; border: 1px solid #00f2ff; border-radius: 4px;
+            transform: scaleX(-1); opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <h1>PHYSICS_CORE v1.0</h1>
+        <p id="stats">RESIDUAL: 0.0000 | NODES: 0</p>
+        <p>Rotate palm to shift Gravity • Pinch to stress bonds</p>
+    </div>
+    <video id="video-preview" autoplay></video>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script type="module">
+        // --- INTEGRATING ENGINE.JS LOGIC ---
+        // Note: We implement the Engine classes here to ensure compatibility
+        class Engine {
+            constructor(maxNodes = 5000) {
+                this.pos = new Float32Array(maxNodes * 3); // 3D for Three.js
+                this.vel = new Float32Array(maxNodes * 3);
+                this.acc = new Float32Array(maxNodes * 3);
+                this.mass = new Float32Array(maxNodes).fill(1.0);
+                this.invMass = new Float32Array(maxNodes).fill(1.0);
+                this.nodesCount = 0;
+                this.gravityVector = { x: 0, y: -0.15, z: 0 };
+                this.maxResidual = 0;
+                this.isHalted = false;
+            }
+
+            addNode(x, y, z, m = 1) {
+                const i = this.nodesCount++;
+                this.pos[i*3] = x; this.pos[i*3+1] = y; this.pos[i*3+2] = z;
+                this.mass[i] = m;
+                this.invMass[i] = 1/m;
+                return i;
+            }
+
+            // Updates the gravity based on hand rotation
+            updateGravity(rotX, rotY) {
+                this.gravityVector.x = rotY * 0.5;
+                this.gravityVector.y = -0.15 + (rotX * 0.5);
+            }
+
+            step(h) {
+                if(this.isHalted) return;
+                for(let i=0; i<this.nodesCount; i++) {
+                    // Apply Gravity
+                    this.vel[i*3] += this.gravityVector.x * h;
+                    this.vel[i*3+1] += this.gravityVector.y * h;
+                    this.vel[i*3+2] += this.gravityVector.z * h;
+
+                    // Advance Kinematic
+                    this.pos[i*3] += this.vel[i*3] * h;
+                    this.pos[i*3+1] += this.vel[i*3+1] * h;
+                    this.pos[i*3+2] += this.vel[i*3+2] * h;
+
+                    // Simple drag to keep simulation stable
+                    this.vel[i*3] *= 0.99;
+                    this.vel[i*3+1] *= 0.99;
+                    this.vel[i*3+2] *= 0.99;
+                }
+            }
+        }
+
+        // --- THREE.JS SETUP ---
+        let scene, camera, renderer, engine, particles;
+        const MAX_PHYSICS_NODES = 5000;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 50;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            engine = new Engine(MAX_PHYSICS_NODES);
+            
+            // Create initial physical sphere
+            for(let i=0; i<MAX_PHYSICS_NODES; i++) {
+                const phi = Math.acos(-1 + (2 * i) / MAX_PHYSICS_NODES);
+                const theta = Math.sqrt(MAX_PHYSICS_NODES * Math.PI) * phi;
+                engine.addNode(
+                    20 * Math.cos(theta) * Math.sin(phi),
+                    20 * Math.sin(theta) * Math.sin(phi),
+                    20 * Math.cos(phi)
+                );
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(engine.pos, 3));
+            
+            const material = new THREE.PointsMaterial({
+                color: 0x00f2ff,
+                size: 0.5,
+                transparent: true,
+                blending: THREE.AdditiveBlending
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            initHandTracking();
+            animate();
+        }
+
+        function initHandTracking() {
+            const videoElement = document.getElementById('video-preview');
+            const hands = new Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            hands.setOptions({ maxNumHands: 1, minDetectionConfidence: 0.5 });
+            hands.onResults((results) => {
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const landmarks = results.multiHandLandmarks[0];
+                    
+                    // Map Hand Tilt to Engine Gravity
+                    const rotX = (landmarks[9].y - 0.5) * 2;
+                    const rotY = (landmarks[9].x - 0.5) * 2;
+                    engine.updateGravity(rotX, rotY);
+
+                    // Pinch causes "Explosion" (Kinematic Impulse)
+                    const dist = Math.hypot(landmarks[4].x - landmarks[8].x, landmarks[4].y - landmarks[8].y);
+                    if(dist > 0.15) {
+                        for(let i=0; i<engine.nodesCount; i++) {
+                            engine.vel[i*3] += (Math.random()-0.5) * dist;
+                            engine.vel[i*3+1] += (Math.random()-0.5) * dist;
+                        }
+                    }
+                }
+            });
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => { await hands.send({ image: videoElement }); },
+                width: 640, height: 480
+            });
+            cameraUtils.start();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Physics Step
+            engine.step(0.1); 
+            
+            // Sync Three.js with Physics Engine
+            particles.geometry.attributes.position.needsUpdate = true;
+            
+            document.getElementById('stats').innerText = 
+                `GRAVITY: ${engine.gravityVector.x.toFixed(2)}, ${engine.gravityVector.y.toFixed(2)} | NODES: ${engine.nodesCount}`;
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
